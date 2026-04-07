@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Video outputs
+downloads/
+scenes/
+*.mp4
+*.mkv
+*.webm
+*.mov
+
+# Analysis artifacts
+*.cuts.json
+*.scenes.json
+*.reframe_*.json
+.scene_tmp/
+
+# Credentials
+yt-cookies/
+
+# Tools
+codedb.snapshot
+rife-ncnn-vulkan/
+
+# Temp
+logs/
