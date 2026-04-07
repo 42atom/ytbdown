@@ -11,6 +11,7 @@ Auto Reframe — 视频智能重构图
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -232,31 +233,151 @@ def interpolate_path(
     return result
 
 
-# ////// 渲染阶段：管道流式输出
+# ////// 渲染阶段
+
+# RIFE 插帧工具路径（可选，不存在则回退 minterpolate）
+RIFE_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "rife-ncnn-vulkan", "rife-ncnn-vulkan")
+RIFE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "rife-ncnn-vulkan", "rife")
+
+
+def _rife_available() -> bool:
+    return os.path.isfile(RIFE_BIN) and os.path.isdir(RIFE_MODEL)
+
+
+def _render_with_rife(
+    video_path: str, crop_coords: list[tuple[int, int]],
+    info: dict, output_path: str, speed: float,
+):
+    """RIFE 光流插帧：裁切帧 → PNG → rife 推理 → ffmpeg 合成"""
+    import tempfile, shutil
+
+    crop_w, crop_h = info["crop_w"], info["crop_h"]
+    fps = info["fps"]
+    total = info["frames"]
+    output_h = int(OUTPUT_WIDTH * crop_h / crop_w)
+    target_frames = int(total / speed)
+
+    tmp_in = tempfile.mkdtemp(prefix="rife_in_")
+    tmp_out = tempfile.mkdtemp(prefix="rife_out_")
+
+    try:
+        # Step 1: 裁切帧保存为 PNG
+        cap = cv2.VideoCapture(video_path)
+        prev_xy = None
+        max_delta = 0
+        written = 0
+
+        print(f"Step 1/3: 裁切帧写入 ({total} 帧) ...")
+        for frame_idx in range(min(total, len(crop_coords))):
+            ret, frame = cap.read()
+            if not ret: break
+
+            x, y = crop_coords[frame_idx]
+            if prev_xy:
+                delta = abs(x - prev_xy[0]) + abs(y - prev_xy[1])
+                max_delta = max(max_delta, delta)
+            prev_xy = (x, y)
+
+            cropped = frame[y:y+crop_h, x:x+crop_w]
+            if cropped.shape[1] != crop_w or cropped.shape[0] != crop_h:
+                cropped = cv2.resize(cropped, (crop_w, crop_h))
+
+            # 缩放到输出尺寸后保存（减少 rife 计算量）
+            resized = cv2.resize(cropped, (OUTPUT_WIDTH, output_h))
+            cv2.imwrite(os.path.join(tmp_in, f"{written:08d}.png"), resized)
+            written += 1
+
+            if written % 50 == 0:
+                print(f"  {written}/{total} 裁切帧")
+
+        cap.release()
+        print(f"  裁切完成: {written} 帧, 最大跳变 {max_delta}px")
+
+        # Step 2: RIFE 插帧
+        # 默认模型(rife-v2.3)只支持2x插帧
+        # speed=0.5 → 1 pass (2x), speed=0.25 → 2 passes (4x)
+        interp_passes = max(1, round(math.log2(1 / speed)))
+        print(f"Step 2/3: RIFE 插帧 (speed={speed}, {interp_passes} pass{'es' if interp_passes > 1 else ''}) ...")
+
+        src_dir = tmp_in
+        for p in range(interp_passes):
+            pass_out = tmp_out if p == interp_passes - 1 else os.path.join(tmp_in, f"_pass{p}")
+            os.makedirs(pass_out, exist_ok=True)
+            src_count = len([f for f in os.listdir(src_dir) if f.endswith(".png")])
+
+            rife_cmd = [
+                RIFE_BIN,
+                "-i", src_dir,
+                "-o", pass_out,
+                "-m", RIFE_MODEL,
+                "-x",
+                "-j", "1:2:2",
+            ]
+            print(f"  Pass {p+1}/{interp_passes}: {src_count} 帧 ...")
+            rife_result = subprocess.run(rife_cmd, capture_output=True, text=True)
+            if rife_result.returncode != 0:
+                print(f"RIFE 失败: {rife_result.stderr[-300:]}")
+                return
+
+            if p < interp_passes - 1:
+                src_dir = pass_out
+
+        # 统计插帧输出
+        out_frames = len([f for f in os.listdir(tmp_out) if f.endswith(".png")])
+        print(f"  RIFE 完成: {out_frames} 帧")
+
+        # Step 3: ffmpeg 合成
+        print(f"Step 3/3: ffmpeg 合成 ...")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", os.path.join(tmp_out, "%08d.png"),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            output_path
+        ], capture_output=True)
+
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        dur = out_frames / fps
+        print(f"渲染完成: {output_path} ({size_mb:.1f}MB, {dur:.1f}s)")
+        print(f"最大帧间跳变: {max_delta}px")
+
+    finally:
+        shutil.rmtree(tmp_in, ignore_errors=True)
+        shutil.rmtree(tmp_out, ignore_errors=True)
+
 
 def render_reframed(
     video_path: str, crop_coords: list[tuple[int, int]],
     info: dict, output_path: str, speed: float = 1.0,
 ):
     """
-    单趟流式渲染：OpenCV 读帧 → numpy 裁切 → pipe 推 ffmpeg。
-    零临时文件，亚像素级平滑，保留原始音轨。
-    speed < 1：慢动作（setpts 插帧 + atempo 慢音）
+    渲染裁切视频。
+    speed < 1 + rife 可用: RIFE 光流插帧（高质量）
+    speed < 1 + 无 rife:    ffmpeg minterpolate（回退）
+    speed == 1.0:            直接 pipe 流式输出
     """
     crop_w, crop_h = info["crop_w"], info["crop_h"]
     fps = info["fps"]
     total = info["frames"]
 
-    # 输出高度 = 按裁切宽等比（9:16）
+    # RIFE 路径：裁切 → PNG → rife → ffmpeg
+    if speed < 1.0 and _rife_available():
+        print(f"[RIFE 光流插帧] speed={speed}, 目标帧数={int(total/speed)}")
+        _render_with_rife(video_path, crop_coords, info, output_path, speed)
+        return
+
+    # 直接 pipe 或 minterpolate 回退
     output_h = int(OUTPUT_WIDTH * crop_h / crop_w)
 
-    # 视频滤镜链
     vf_parts = [f"scale={OUTPUT_WIDTH}:{output_h}"]
     if speed < 1.0:
-        # 慢动作：setpts 拉长 + minterpolate 运动补偿插帧（消除闪烁）
         vf_parts.append(f"setpts={1/speed:.3f}*PTS")
         vf_parts.append(f"minterpolate=mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps={fps:.0f}")
-        output_fps = fps  # 插帧回原帧率，时长自动拉长
+        print(f"[minterpolate 回退] speed={speed} (安装 rife-ncnn-vulkan 获得更高质量)")
+        output_fps = fps
     elif speed > 1.0:
         vf_parts.append(f"setpts={1/speed:.3f}*PTS")
         output_fps = fps
