@@ -328,16 +328,34 @@ def _render_with_rife(
         out_frames = len([f for f in os.listdir(tmp_out) if f.endswith(".png")])
         print(f"  RIFE 完成: {out_frames} 帧")
 
-        # Step 3: ffmpeg 合成
-        print(f"Step 3/3: ffmpeg 合成 ...")
-        subprocess.run([
+        # Step 3: ffmpeg 合成（TikTok 标准：H.264 High Profile + AAC + 30fps）
+        # 视频：PNG序列(24fps) → setpts保持时长 → fps=30
+        # 音频：原始场景音轨 atempo慢速
+        print(f"Step 3/3: ffmpeg 合成 (30fps, H.264 High Profile, AAC) ...")
+        ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
             "-i", os.path.join(tmp_out, "%08d.png"),
-            "-c:v", "h264_videotoolbox", "-b:v", "8000k",
-            "-pix_fmt", "yuv420p",
+            "-i", video_path,
+        ]
+        if speed < 1.0:
+            ffmpeg_cmd += [
+                "-filter_complex",
+                f"[1:a]atempo={speed}[a]",
+                "-map", "0:v", "-map", "[a]",
+                "-c:a", "aac", "-b:a", "128k",
+            ]
+        else:
+            ffmpeg_cmd += ["-map", "0:v", "-map", "1:a?", "-c:a", "aac", "-b:a", "192k"]
+        ffmpeg_cmd += [
+            "-c:v", "h264_videotoolbox",
+            "-profile:v", "high",
+            "-b:v", "8000k",
+            "-vf", f"fps=30",
+            "-shortest",
             output_path
-        ], capture_output=True)
+        ]
+        subprocess.run(ffmpeg_cmd, capture_output=True)
 
         size_mb = os.path.getsize(output_path) / 1024 / 1024
         dur = out_frames / fps
@@ -369,38 +387,40 @@ def render_reframed(
         _render_with_rife(video_path, crop_coords, info, output_path, speed)
         return
 
-    # 直接 pipe 或 minterpolate 回退
+    # 直接 pipe 或 minterpolate 回退（TikTok 标准：H.264 High Profile + AAC + 30fps）
     output_h = int(OUTPUT_WIDTH * crop_h / crop_w)
 
-    vf_parts = [f"scale={OUTPUT_WIDTH}:{output_h}"]
+    # 滤镜链：setpts 慢动作 → scale → fps=30
+    vf_parts = []
     if speed < 1.0:
         vf_parts.append(f"setpts={1/speed:.3f}*PTS")
-        vf_parts.append(f"minterpolate=mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps={fps:.0f}")
         print(f"[minterpolate 回退] speed={speed} (安装 rife-ncnn-vulkan 获得更高质量)")
-        output_fps = fps
     elif speed > 1.0:
         vf_parts.append(f"setpts={1/speed:.3f}*PTS")
-        output_fps = fps
-    else:
-        output_fps = fps
+    vf_parts += [f"scale={OUTPUT_WIDTH}:{output_h}", "fps=30"]
 
-    # ffmpeg 参数构建
+    # 音频处理
+    audio_parts = []
+    if speed == 1.0:
+        audio_parts = ["-map", "1:a?", "-c:a", "aac", "-b:a", "192k"]
+    elif speed < 1.0:
+        audio_parts = [
+            "-filter_complex", f"[1:a]atempo={speed}[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-c:a", "aac", "-b:a", "128k",
+        ]
+
     ffmpeg_args = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{crop_w}x{crop_h}", "-r", str(fps),
         "-i", "pipe:0",
         "-i", video_path,
-        "-map", "0:v",
-    ]
-    if speed == 1.0:
-        ffmpeg_args += ["-map", "1:a?", "-c:a", "aac", "-b:a", "192k"]
-    else:
-        ffmpeg_args += ["-an"]
-    ffmpeg_args += [
-        "-c:v", "h264_videotoolbox", "-b:v", "8000k",
+    ] + audio_parts + [
+        "-c:v", "h264_videotoolbox",
+        "-profile:v", "high",
+        "-b:v", "8000k",
         "-vf", ",".join(vf_parts),
-        "-r", str(round(output_fps, 3)),
         "-shortest",
         output_path
     ]
