@@ -334,7 +334,7 @@ def _render_with_rife(
             "ffmpeg", "-y",
             "-framerate", str(fps),
             "-i", os.path.join(tmp_out, "%08d.png"),
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:v", "hevc_videotoolbox", "-b:v", "8000k",
             "-pix_fmt", "yuv420p",
             output_path
         ], capture_output=True)
@@ -398,7 +398,7 @@ def render_reframed(
     else:
         ffmpeg_args += ["-an"]
     ffmpeg_args += [
-        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-c:v", "hevc_videotoolbox", "-b:v", "8000k",
         "-vf", ",".join(vf_parts),
         "-r", str(round(output_fps, 3)),
         "-shortest",
