@@ -283,7 +283,7 @@ def split_scenes(video_path: str, scenes: list[tuple[float, float]], output_dir:
                 "ffmpeg", "-y",
                 "-ss", str(start), "-i", video_path,
                 "-t", str(duration),
-                "-c:v", "hevc_videotoolbox", "-b:v", "8000k",
+                "-c:v", "h264_videotoolbox", "-b:v", "8000k",
                 "-c:a", "aac", "-b:a", "192k",
                 out_path
             ]
