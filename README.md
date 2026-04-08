@@ -1,6 +1,6 @@
-# ytbdown
+# Vertical-Video
 
-Aerial video processing toolkit — download, semantic scene segmentation, and intelligent reframing for vertical (9:16) output.
+竖屏视频工具库 — 下载、语义分割、横转竖、图片动态化，完整的短视频制作管线。
 
 ## Tools
 
