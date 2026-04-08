@@ -145,6 +145,9 @@ def analyze_crop_path(
     if crop_w > w:
         crop_w = w
         crop_h = int(w * th / tw)
+    # ffmpeg 要求宽高为偶数
+    crop_w = crop_w // 2 * 2
+    crop_h = crop_h // 2 * 2
     info["crop_w"] = crop_w
     info["crop_h"] = crop_h
     display_frac = crop_w / w
@@ -387,28 +390,18 @@ def render_reframed(
         _render_with_rife(video_path, crop_coords, info, output_path, speed)
         return
 
-    # 直接 pipe 或 minterpolate 回退（TikTok 标准：H.264 High Profile + AAC + 30fps）
+    # 直接 pipe 渲染
     output_h = int(OUTPUT_WIDTH * crop_h / crop_w)
+    # 输出尺寸也要偶数
+    output_h = output_h // 2 * 2
 
-    # 滤镜链：setpts 慢动作 → scale → fps=30
-    vf_parts = []
+    vf_parts = [f"scale={OUTPUT_WIDTH}:{output_h}"]
     if speed < 1.0:
         vf_parts.append(f"setpts={1/speed:.3f}*PTS")
+        vf_parts.append(f"minterpolate=mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps={fps:.0f}")
         print(f"[minterpolate 回退] speed={speed} (安装 rife-ncnn-vulkan 获得更高质量)")
     elif speed > 1.0:
         vf_parts.append(f"setpts={1/speed:.3f}*PTS")
-    vf_parts += [f"scale={OUTPUT_WIDTH}:{output_h}", "fps=30"]
-
-    # 音频处理
-    audio_parts = []
-    if speed == 1.0:
-        audio_parts = ["-map", "1:a?", "-c:a", "aac", "-b:a", "192k"]
-    elif speed < 1.0:
-        audio_parts = [
-            "-filter_complex", f"[1:a]atempo={speed}[a]",
-            "-map", "0:v", "-map", "[a]",
-            "-c:a", "aac", "-b:a", "128k",
-        ]
 
     ffmpeg_args = [
         "ffmpeg", "-y",
@@ -416,13 +409,18 @@ def render_reframed(
         "-s", f"{crop_w}x{crop_h}", "-r", str(fps),
         "-i", "pipe:0",
         "-i", video_path,
-    ] + audio_parts + [
-        "-c:v", "h264_videotoolbox",
-        "-profile:v", "high",
-        "-b:v", "8000k",
+        "-map", "0:v",
+    ]
+    if speed == 1.0:
+        ffmpeg_args += ["-map", "1:a?", "-c:a", "aac", "-b:a", "192k"]
+    else:
+        ffmpeg_args += ["-an"]
+    ffmpeg_args += [
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-pix_fmt", "yuv420p",
         "-vf", ",".join(vf_parts),
         "-shortest",
-        output_path
+        output_path,
     ]
     process = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 

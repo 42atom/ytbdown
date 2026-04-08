@@ -161,11 +161,75 @@ def _ease(t: float) -> float:
     return t * t * (3 - 2 * t)
 
 
+# 单段运镜的理想时长范围（秒）
+SEGMENT_MIN = 6.0
+SEGMENT_MAX = 15.0
+
+
+def _plan_segments(duration: float, img_w: int, img_h: int,
+                   out_w: int, out_h: int, sal: dict) -> list[dict]:
+    """
+    根据总时长拆分运镜段落。
+
+    短场景（<15s）: 单段运镜
+    中场景（15-30s）: 两段（运镜 + 反向/漂移）
+    长场景（>30s）: 多段交替，每段 8-12 秒
+    """
+    if duration <= SEGMENT_MAX:
+        # 短场景：单段
+        move = plan_move(img_w, img_h, out_w, out_h, sal)
+        return [{"move": move, "duration": duration}]
+
+    # 计算段数：每段 8-12 秒
+    n_segs = max(2, round(duration / 10.0))
+    seg_dur = duration / n_segs
+
+    cx, cy = img_w / 2, img_h / 2
+    sal_x, sal_y = sal["cx"], sal["cy"]
+    max_zoom = min(1.8, min(img_w / out_w, img_h / out_h))
+    mid_zoom = (1.0 + max_zoom) / 2
+    min_zoom = 1.0
+
+    # 生成多段交替运镜：push → hold → drift → pull → hold → ...
+    patterns = [
+        lambda: plan_move(img_w, img_h, out_w, out_h, sal),  # 显著性驱动
+        lambda: {"type": "hold_push",  # 定点缓推
+                 "start": {"cx": cx, "cy": cy, "zoom": min_zoom},
+                 "end": {"cx": cx, "cy": cy, "zoom": mid_zoom * 0.85}},
+        lambda: {"type": "drift",  # 对角漂移
+                 "start": {"cx": cx - img_w * 0.06, "cy": cy - img_h * 0.06,
+                            "zoom": mid_zoom * 0.9},
+                 "end": {"cx": cx + img_w * 0.06, "cy": cy + img_h * 0.06,
+                          "zoom": min_zoom}},
+        lambda: {"type": "pull",  # 拉出
+                 "start": {"cx": sal_x, "cy": sal_y, "zoom": max_zoom * 0.8},
+                 "end": {"cx": cx, "cy": cy, "zoom": min_zoom}},
+        lambda: {"type": "hold_drift",  # 缓慢横漂
+                 "start": {"cx": cx - img_w * 0.08, "cy": cy, "zoom": mid_zoom * 0.95},
+                 "end": {"cx": cx + img_w * 0.08, "cy": cy, "zoom": mid_zoom * 0.95}},
+    ]
+
+    segments = []
+    for i in range(n_segs):
+        pattern_fn = patterns[i % len(patterns)]
+        move = pattern_fn()
+        # 相邻段反向，避免跳变：上一段的终点接近下一段的起点
+        if i > 0 and segments:
+            prev_end = segments[-1]["move"]["end"]
+            move["start"]["cx"] = prev_end["cx"]
+            move["start"]["cy"] = prev_end["cy"]
+            move["start"]["zoom"] = prev_end["zoom"]
+        segments.append({"move": move, "duration": seg_dur})
+
+    return segments
+
+
 def gen_motion(image_path: str, duration: float, output: str,
                w: int = 1920, h: int = 1080, fps: int = 30,
                gravity: str = "center") -> str:
     """
     图片 → 有运镜的视频片段。
+    短场景单段运镜，长场景自动拆成多段交替运镜。
 
     参数:
       image_path  输入图片路径
@@ -192,13 +256,11 @@ def gen_motion(image_path: str, duration: float, output: str,
                            interpolation=cv2.INTER_LANCZOS4)
         img_h, img_w = image.shape[:2]
 
-    # 显著性分析 + 运镜规划
+    # 显著性分析
     sal = analyze_saliency(image)
-    move = plan_move(img_w, img_h, w, h, sal)
 
-    total_frames = int(duration * fps)
-    start = move["start"]
-    end = move["end"]
+    # 拆分运镜段落
+    segments = _plan_segments(duration, img_w, img_h, w, h, sal)
 
     # ffmpeg pipe 渲染
     ffmpeg_args = [
@@ -223,24 +285,31 @@ def gen_motion(image_path: str, duration: float, output: str,
             stderr_chunks.append(chunk)
     threading.Thread(target=drain, daemon=True).start()
 
-    for i in range(total_frames):
-        t = _ease(i / max(total_frames - 1, 1))
+    # 逐段渲染
+    types = []
+    for seg in segments:
+        move = seg["move"]
+        seg_frames = int(seg["duration"] * fps)
+        start = move["start"]
+        end = move["end"]
+        types.append(move["type"])
 
-        cx = start["cx"] + (end["cx"] - start["cx"]) * t
-        cy = start["cy"] + (end["cy"] - start["cy"]) * t
-        zoom = start["zoom"] + (end["zoom"] - start["zoom"]) * t
+        for i in range(seg_frames):
+            t = _ease(i / max(seg_frames - 1, 1))
 
-        # 裁切框
-        crop_h = int(img_h / zoom)
-        crop_w = int(crop_h * w / h)
+            cx = start["cx"] + (end["cx"] - start["cx"]) * t
+            cy = start["cy"] + (end["cy"] - start["cy"]) * t
+            zoom = start["zoom"] + (end["zoom"] - start["zoom"]) * t
 
-        # 边界钳制
-        x1 = int(max(0, min(cx - crop_w / 2, img_w - crop_w)))
-        y1 = int(max(0, min(cy - crop_h / 2, img_h - crop_h)))
+            crop_h = int(img_h / zoom)
+            crop_w = int(crop_h * w / h)
 
-        cropped = image[y1:y1+crop_h, x1:x1+crop_w]
-        resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
-        process.stdin.write(resized.tobytes())
+            x1 = int(max(0, min(cx - crop_w / 2, img_w - crop_w)))
+            y1 = int(max(0, min(cy - crop_h / 2, img_h - crop_h)))
+
+            cropped = image[y1:y1+crop_h, x1:x1+crop_w]
+            resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            process.stdin.write(resized.tobytes())
 
     process.stdin.close()
     process.wait()
@@ -249,4 +318,4 @@ def gen_motion(image_path: str, duration: float, output: str,
         err = b"".join(stderr_chunks).decode(errors="replace")
         raise RuntimeError(f"ffmpeg 错误: {err[-300:]}")
 
-    return move["type"]
+    return "+".join(types)
